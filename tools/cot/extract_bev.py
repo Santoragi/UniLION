@@ -10,7 +10,11 @@ Subcommands (run from the repository root with PYTHONPATH=.):
   run       fill the rows of one shard. A shard is a contiguous block of whole scenes in dataset order, so
             the streaming temporal memory sees every scene from its first frame, as in evaluation.
   finalize  check that every row was written once, values are finite and tokens match; {split}_check.json
+  verify    re-infer random rows from the start of their scenes and compare with the cache; {split}_verify.json
   axis      detection heatmap at GT box centres under each candidate (row, column) reading; axis_check.json
+  pick      choose whole scenes with a seed for a partial cache (stage1 8.2 probe); {split}_rows.json
+With --rows-file (from pick), init and run build a partial cache: row i holds the i-th picked row of the full
+dataset order, and the meta records it as source_row.
 """
 import argparse
 import json
@@ -102,36 +106,84 @@ def loader(ds, rows, workers):
                       collate_fn=partial(collate, samples_per_gpu=1))
 
 
+def selected(infos, rows_file):
+    """Dataset rows a cache holds, in dataset order: all of them, or those listed by pick."""
+    if not rows_file:
+        return list(range(len(infos)))
+    sel = json.load(open(rows_file))
+    rows = sel['rows']
+    assert rows == sorted(rows) and all(infos[r]['token'] == t for r, t in zip(rows, sel['tokens'])), rows_file
+    return rows
+
+
+def cmd_pick(a):
+    """Whole scenes in a seeded random order, up to --fraction of the scenes or --frames keyframes. A row depends on
+    the earlier frames of its scene through the streaming memory, so a partial cache is built from scene starts.
+    With --frames the picked rows are cut to exactly that many in dataset order."""
+    _, ds = build_dataset_for(a.config, a.split)
+    infos = ds.data_infos
+    scenes = []
+    for i, inf in enumerate(infos):
+        if i == 0 or inf['scene_token'] != infos[i - 1]['scene_token']:
+            scenes.append([])
+        scenes[-1].append(i)
+    order = np.random.default_rng(a.seed).permutation(len(scenes))
+    chosen = []
+    for k in order:
+        if a.fraction and len(chosen) >= round(a.fraction * len(scenes)):
+            break
+        if a.frames and sum(len(scenes[c]) for c in chosen) >= a.frames:
+            break
+        chosen.append(int(k))
+    rows = sorted(r for c in chosen for r in scenes[c])
+    if a.frames:
+        rows = rows[:a.frames]
+    os.makedirs(a.out_dir, exist_ok=True)
+    out = dict(split=a.split, seed=a.seed, fraction=a.fraction, frames=a.frames,
+               scenes=sorted({infos[r]['scene_token'] for r in rows}), rows=rows,
+               tokens=[infos[r]['token'] for r in rows])
+    path = os.path.join(a.out_dir, '%s_rows.json' % a.split)
+    if os.path.exists(path):
+        raise SystemExit('%s exists' % path)
+    json.dump(out, open(path, 'w'))
+    print('pick %s: %d of %d scenes, %d rows -> %s' % (a.split, len(out['scenes']), len(scenes), len(rows), path))
+
+
 def cmd_init(a):
     _, ds = build_dataset_for(a.config, a.split)
     infos = ds.data_infos
+    sel = selected(infos, a.rows_file)
     os.makedirs(a.out_dir, exist_ok=True)
     path = os.path.join(a.out_dir, '%s.f16.npy' % a.split)
     if os.path.exists(path):
         raise SystemExit('%s exists; remove it to start over' % path)
-    np.lib.format.open_memmap(path, mode='w+', dtype=np.float16, shape=(len(infos), C_BEV, a.pool, a.pool)).flush()
-    json.dump({inf['token']: i for i, inf in enumerate(infos)},
+    np.lib.format.open_memmap(path, mode='w+', dtype=np.float16, shape=(len(sel), C_BEV, a.pool, a.pool)).flush()
+    json.dump({infos[r]['token']: i for i, r in enumerate(sel)},
               open(os.path.join(a.out_dir, '%s_index.json' % a.split), 'w'))
-    rows, seen = [], {}
-    for i, inf in enumerate(infos):
-        k = seen.get(inf['scene_token'], 0)
-        seen[inf['scene_token']] = k + 1
-        rows.append(dict(row=i, token=inf['token'], scene_token=inf['scene_token'], scene_name=inf['scene_name'],
-                         idx_in_scene=k, timestamp=inf['timestamp'], prev=inf['prev'], next=inf['next'],
+    rows, seen, keep = [], {}, set(sel)
+    for r, inf in enumerate(infos):
+        seen[inf['scene_token']] = seen.get(inf['scene_token'], 0) + 1
+        if r not in keep:
+            continue
+        rows.append(dict(row=len(rows), source_row=r, token=inf['token'], scene_token=inf['scene_token'],
+                         scene_name=inf['scene_name'], idx_in_scene=seen[inf['scene_token']] - 1,
+                         timestamp=inf['timestamp'], prev=inf['prev'], next=inf['next'],
                          bev2global=bev2global(inf).tolist(), lidar2global=lidar2global(inf).tolist()))
     json.dump(dict(frame='ego at CAM_FRONT timestamp (UniLION ToEgo); x forward, y left, z up',
                    range_m=[-HALF, HALF], full_grid=FULL, pool=a.pool, channels=C_BEV,
-                   feature='pts_neck output, adaptive_avg_pool2d', rows=rows),
+                   feature='pts_neck output, adaptive_avg_pool2d', rows_file=a.rows_file, rows=rows),
               open(os.path.join(a.out_dir, '%s_meta.json' % a.split), 'w'))
-    print('init %s: %d rows, %d scenes -> %s' % (a.split, len(infos), len(seen), path))
+    print('init %s: %d rows, %d scenes -> %s' % (a.split, len(rows), len({x['scene_token'] for x in rows}), path))
 
 
 def cmd_run(a):
     cfg, ds = build_dataset_for(a.config, a.split)
     infos = ds.data_infos
-    rows = shards(infos, a.num_shards)[a.shard]
+    sel = selected(infos, a.rows_file)
+    pos = {r: i for i, r in enumerate(sel)}  # dataset row -> cache row
+    rows = [sel[i] for i in shards([infos[r] for r in sel], a.num_shards)[a.shard]]
     mm = np.load(os.path.join(a.out_dir, '%s.f16.npy' % a.split), mmap_mode='r+')
-    assert mm.shape == (len(infos), C_BEV, a.pool, a.pool), mm.shape
+    assert mm.shape == (len(sel), C_BEV, a.pool, a.pool), mm.shape
     model = load_model(cfg, a.checkpoint)
     feats = {}
     model.module.pts_neck.register_forward_hook(
@@ -146,8 +198,8 @@ def cmd_run(a):
             model(return_loss=False, rescale=True, **data)
             bev = feats.pop('bev')
             assert tuple(bev.shape) == (1, C_BEV, FULL, FULL), tuple(bev.shape)
-            mm[row] = F.adaptive_avg_pool2d(bev.float(), a.pool)[0].half().cpu().numpy()
-            done.append(row)
+            mm[pos[row]] = F.adaptive_avg_pool2d(bev.float(), a.pool)[0].half().cpu().numpy()
+            done.append(pos[row])
             if (j + 1) % 500 == 0:
                 mm.flush()
                 print('shard %d/%d: %d/%d rows, %.1f rows/s' % (a.shard, a.num_shards, j + 1, len(rows),
@@ -186,6 +238,71 @@ def cmd_finalize(a):
                     and report['index_matches_meta'] and len(index) == n)
     json.dump(report, open(os.path.join(a.out_dir, '%s_check.json' % a.split), 'w'), indent=2)
     print(json.dumps(report, indent=2))
+
+
+RTOL, ATOL = 2.0 ** -10, 2.0 ** -14  # verify: one float16 ulp relative; smallest normal float16 absolute
+
+
+def compare(new, ref16):
+    """new: float32 [C, P, P]; ref16: float16 row it should reproduce."""
+    ref = ref16.astype(np.float32)
+    diff = np.abs(new - ref)
+    return dict(max_abs_diff=float(diff.max()), rel_l2=float(np.linalg.norm(new - ref) / np.linalg.norm(ref)),
+                equal_after_fp16_rounding=float((new.astype(np.float16) == ref16).mean()),
+                within_tolerance=bool((diff <= RTOL * np.abs(ref) + ATOL).all()))
+
+
+def reset_memory(model):
+    m = model.module
+    m.prev_token, m.prev_features, m.prev_voxel_coords, m.prev_timestamps = [], [], [], []
+
+
+def cmd_verify(a):
+    """Stage1 8.3: re-infer --samples random rows and compare with the cache. The streaming memory makes a row
+    depend on earlier frames of its scene, so each picked row is re-run from the first frame of its scene, with the
+    memory cleared. With --repeats R > 1 every scene is re-run R times and the re-runs are also compared with each
+    other, to tell GPU non-determinism from a wrong cache row; the result goes to {split}_verify_r{R}.json."""
+    cfg, ds = build_dataset_for(a.config, a.split)
+    infos = ds.data_infos
+    mm = np.load(os.path.join(a.out_dir, '%s.f16.npy' % a.split), mmap_mode='r')
+    picks = sorted(np.random.default_rng(a.seed).choice(len(infos), a.samples, replace=False).tolist())
+    by_scene = {}
+    for r in picks:
+        by_scene.setdefault(infos[r]['scene_token'], []).append(r)
+    model = load_model(cfg, a.checkpoint)
+    feats = {}
+    model.module.pts_neck.register_forward_hook(
+        lambda _m, _i, out: feats.__setitem__('bev', out[0] if isinstance(out, (list, tuple)) else out))
+    samples = []
+    with torch.no_grad():
+        for scene, targets in by_scene.items():
+            start = targets[0]
+            while start > 0 and infos[start - 1]['scene_token'] == scene:
+                start -= 1
+            rows = list(range(start, targets[-1] + 1))
+            runs = {r: [] for r in targets}
+            for _ in range(a.repeats):
+                reset_memory(model)
+                for j, data in enumerate(loader(ds, rows, a.workers)):
+                    model(return_loss=False, rescale=True, **data)
+                    bev = feats.pop('bev')
+                    if rows[j] in runs:
+                        runs[rows[j]].append(F.adaptive_avg_pool2d(bev.float(), a.pool)[0].cpu().numpy())
+            for r in targets:
+                s = dict(row=r, token=infos[r]['token'], frames_from_scene_start=r - start,
+                         cached_std=float(mm[r].astype(np.float32).std()), **compare(runs[r][0], mm[r]))
+                if a.repeats > 1:
+                    s['vs_cache'] = [compare(x, mm[r]) for x in runs[r]]
+                    s['between_reruns'] = [compare(x, runs[r][0].astype(np.float16)) for x in runs[r][1:]]
+                    nb = r - 1 if r > start else r + 1  # neighbouring frame: what a misplaced row would look like
+                    s['neighbour_frame_rel_l2'] = compare(mm[nb].astype(np.float32), mm[r])['rel_l2']
+                samples.append(s)
+    out = dict(split=a.split, seed=a.seed, repeats=a.repeats,
+               tolerance='|new - cached| <= %g * |cached| + %g' % (RTOL, ATOL),
+               samples=samples, ok=all(s['within_tolerance'] for s in samples))
+    name = '%s_verify.json' % a.split if a.repeats == 1 else '%s_verify_r%d.json' % (a.split, a.repeats)
+    json.dump(out, open(os.path.join(a.out_dir, name), 'w'), indent=2)
+    print(json.dumps(out, indent=2))
 
 
 def cmd_axis(a):
@@ -238,7 +355,7 @@ def cmd_axis(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('cmd', choices=['init', 'run', 'finalize', 'axis'])
+    p.add_argument('cmd', choices=['init', 'run', 'finalize', 'verify', 'axis', 'pick'])
     p.add_argument('--config', default='projects/configs/cot/unilion_lct_det_val.py')
     p.add_argument('--checkpoint')
     p.add_argument('--split', choices=['train', 'val'], required=True)
@@ -247,11 +364,17 @@ def main():
     p.add_argument('--shard', type=int, default=0)
     p.add_argument('--num-shards', type=int, default=1)
     p.add_argument('--workers', type=int, default=4)
-    p.add_argument('--samples', type=int, default=20, help='axis: number of frames from the start of the split')
+    p.add_argument('--samples', type=int, default=20,
+                   help='axis: frames from the start of the split; verify: random rows')
+    p.add_argument('--seed', type=int, default=0, help='verify, pick: seed')
+    p.add_argument('--repeats', type=int, default=1, help='verify: re-runs per scene')
+    p.add_argument('--rows-file', help='init, run: partial cache of the rows picked by pick')
+    p.add_argument('--fraction', type=float, help='pick: fraction of the scenes')
+    p.add_argument('--frames', type=int, help='pick: number of keyframes')
     a = p.parse_args()
-    if a.cmd in ('run', 'axis') and not a.checkpoint:
+    if a.cmd in ('run', 'verify', 'axis') and not a.checkpoint:
         p.error('--checkpoint is required for %s' % a.cmd)
-    dict(init=cmd_init, run=cmd_run, finalize=cmd_finalize, axis=cmd_axis)[a.cmd](a)
+    dict(init=cmd_init, run=cmd_run, finalize=cmd_finalize, verify=cmd_verify, axis=cmd_axis, pick=cmd_pick)[a.cmd](a)
 
 
 if __name__ == '__main__':
