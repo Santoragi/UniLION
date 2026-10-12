@@ -13,3 +13,6 @@ venv/
 .DS_Store
 output
 version.py
+# cot-scene-token: per-server data links and run outputs
+/data
+/work_dirs
