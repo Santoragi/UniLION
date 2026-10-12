@@ -306,7 +306,9 @@ def cmd_verify(a):
 
 
 def cmd_axis(a):
-    """Stage1 8.1: which grid reading puts GT centres on high detection heatmap responses."""
+    """Stage1 8.1: which grid reading of the cached BEV puts GT centres on high detection heatmap responses.
+    TransFusionHead.forward_single transposes its input (permute(0, 1, 3, 2), transfusion_head.py:252) before
+    the heatmap, so the heatmap is transposed back here to the layout of the pts_neck output that is cached."""
     cfg, ds = build_dataset_for(a.config, a.split)
     infos = ds.data_infos
     classes = list(cfg.class_names)
@@ -327,7 +329,7 @@ def cmd_axis(a):
         for j, data in enumerate(loader(ds, rows, a.workers)):
             info = infos[rows[j]]
             model(return_loss=False, rescale=True, **data)
-            h = heat.pop('h')[0].sigmoid().cpu().numpy()  # [classes, 180, 180]
+            h = heat.pop('h')[0].sigmoid().transpose(-1, -2).cpu().numpy()  # [classes, 180, 180], BEV layout
             assert h.shape == (len(classes), FULL, FULL), h.shape
             # UniLION's converter already stores gt_boxes in the BEV frame (ego at CAM_FRONT time),
             # unlike the LiDAR-frame infos of mmdet3d; use the centres as they are.
@@ -345,7 +347,8 @@ def cmd_axis(a):
             rand_resp.extend(h[cls, rng.integers(0, FULL, len(cls)), rng.integers(0, FULL, len(cls))].tolist())
     result = {k: float(np.mean(v)) for k, v in sums.items()}
     best = max(result, key=result.get)
-    out = dict(split=a.split, samples=len(rows), gt_centres=len(rand_resp), mean_heatmap_at_gt=result,
+    out = dict(split=a.split, layout='pts_neck output (heatmap transposed back)', samples=len(rows),
+               gt_centres=len(rand_resp), mean_heatmap_at_gt=result,
                mean_heatmap_random_cells=float(np.mean(rand_resp)), best=best,
                frame='ego at CAM_FRONT timestamp; x forward, y left', cell_m=CELL, half_range_m=HALF,
                index_rule='index = floor((sign * coordinate + %.1f) / %.1f)' % (HALF, CELL))
